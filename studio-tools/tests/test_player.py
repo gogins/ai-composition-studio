@@ -1,0 +1,582 @@
+"""The static player, in a real browser.
+
+A temporary site is assembled (the real docs/studio/ plus compositions
+published by the tools), served by the studio's own static server, and
+driven in headless Chrome by a small harness page. The harness loads the
+player in a phone-sized frame, exercises it, and posts what it saw back to
+the test.
+
+Skipped when no Chrome/Chromium is found (set STUDIO_CHROME to its path).
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+from support import REPO, StudioTestCase
+
+from studio import catalog, environment, publish, serve
+
+CHROME_CANDIDATES = [
+    os.environ.get("STUDIO_CHROME"),
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+]
+
+
+def find_chrome():
+    for candidate in CHROME_CANDIDATES:
+        if candidate and (os.path.isfile(candidate) or shutil.which(candidate)):
+            return candidate if os.path.isfile(candidate) else shutil.which(candidate)
+    return None
+
+
+HARNESS = r"""<!DOCTYPE html>
+<meta charset="utf-8">
+<title>studio player test harness</title>
+<iframe id="frame" src="/studio/" style="width:412px;height:915px;border:0"></iframe>
+<script type="module">
+const mode = new URLSearchParams(location.search).get('mode');
+const frame = document.getElementById('frame');
+const doc = () => frame.contentDocument;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(what, condition, timeout = 15000) {
+  const start = Date.now();
+  for (;;) {
+    let value = null;
+    try { value = condition(); } catch (error) { value = null; }
+    if (value) return value;
+    if (Date.now() - start > timeout) throw new Error('timed out waiting for ' + what);
+    await sleep(40);
+  }
+}
+const state = () => doc() && doc().documentElement.dataset.studioState;
+const text = (selector) => { const node = doc().querySelector(selector); return node ? node.textContent : null; };
+const all = (selector) => [...doc().querySelectorAll(selector)];
+const overflow = () => doc().documentElement.scrollWidth - frame.contentWindow.innerWidth;
+// True once the panel shows the given tab and its content has arrived.
+const tab = (name, selector) => () => doc().getElementById('panel').dataset.tab === name && text(selector);
+async function show(hash, what, condition) {
+  frame.contentWindow.location.hash = hash;
+  return until(`${hash}: ${what}`, condition);
+}
+
+async function run() {
+  const result = { mode, overflow: {} };
+  await until('player to settle', () => state() === 'ready' || state() === 'error');
+  result.state = state();
+  result.catalogError = text('#catalog-error');
+  result.emptyLibrary = text('#empty-library');
+  result.composeFormNew = Boolean(doc().getElementById('compose-form-new'));
+  result.statusBar = text('#site-readiness');
+  const cheatSheet = doc().getElementById('cheat-sheet');
+  result.cheatSheetHref = cheatSheet ? cheatSheet.getAttribute('href') : null;
+  result.cheatSheetLabel = cheatSheet ? cheatSheet.textContent : null;
+  if (cheatSheet) {
+    const response = await fetch(cheatSheet.href);
+    result.commandSheet = await response.text();
+  }
+  // Messages dock is always on screen (windowshade), never a disclosure arrow.
+  result.csoundMessages = Boolean(doc().getElementById('csound-messages'));
+  result.csoundMessagesShade = Boolean(doc().getElementById('csound-messages-shade'));
+  result.csoundMessagesDetails = Boolean(doc().querySelector('#csound-messages summary'));
+  if (mode === 'real') return realSite(result);
+  if (mode !== 'full') return result;
+
+  // Library.
+  result.library = all('.card').map((card) => card.dataset.composition);
+  result.libraryText = text('.library');
+  result.overflow.library = overflow();
+
+  // A composition: versions, prompts, and the player. Creating a version is Cursor's job.
+  await show('#nu', 'version selector', () => doc().getElementById('version-select'));
+  result.title = text('#composition-title');
+  result.versions = all('#version-select option').map((option) => option.value);
+  result.selected = doc().getElementById('version-select').value;
+  result.prompts = all('.prompt pre').map((pre) => pre.textContent);
+  result.newPrompts = all('.prompt.new h2').map((heading) => heading.textContent);
+  result.composeForm = Boolean(doc().getElementById('compose-form'));
+  result.composePrompt = Boolean(doc().getElementById('compose-prompt'));
+  result.composePromptDisabled = (() => {
+    const field = doc().getElementById('compose-prompt');
+    return field ? field.disabled : null;
+  })();
+  result.composeSubmitDisabled = (() => {
+    const button = doc().getElementById('compose-submit');
+    return button ? button.disabled : null;
+  })();
+  const messages = doc().getElementById('csound-messages');
+  const mainPlayer = doc().getElementById('player');
+  result.csoundMessagesOutsidePlayer = Boolean(
+    messages && mainPlayer && !mainPlayer.contains(messages));
+  result.overflow.prompts = overflow();
+
+  // Csound file of the current version.
+  await show('#nu/current/csound', 'csd text', tab('csound', '.source .code'));
+  result.csd = text('.source .code');
+  result.csdDownload = doc().querySelector('.source-file a.download').getAttribute('href');
+  result.overflow.csound = overflow();
+
+  // Generating program.
+  await show('#nu/current/code', 'code text', tab('code', '.source .code'));
+  result.code = text('.source .code');
+  result.codeFiles = all('.source-file').map((item) => item.dataset.file);
+  result.overflow.code = overflow();
+
+  // Files and info.
+  await show('#nu/current/files', 'file table', tab('files', 'table.files'));
+  result.files = all('table.files tbody tr').map((row) => row.children[1].textContent);
+  result.overflow.files = overflow();
+  await show('#nu/current/info', 'info', tab('info', 'dl.info'));
+  result.info = text('dl.info');
+  result.overflow.info = overflow();
+
+  // Comparison with the previous version.
+  await show('#nu/current/compare', 'diff', tab('compare', '#diff-summary'));
+  result.diffSummary = text('#diff-summary');
+  result.diffAdded = all('.diff-line.add .diff-text').map((line) => line.textContent);
+  result.diffRemoved = all('.diff-line.remove .diff-text').map((line) => line.textContent);
+  result.compareOthers = all('#compare-other option').map((option) => option.value);
+  result.overflow.compare = overflow();
+
+  // Real-time player: play, survive a tab change, then seek.
+  await show('#nu/current/prompts', 'player', tab('prompts', '.prompt pre'));
+  const player = doc().getElementById('player');
+  async function playFrom(root, seconds = null) {
+    const before = Number(root.dataset.completed || 0);
+    if (seconds !== null) {
+      const seek = root.querySelector('.seek');
+      seek.value = String(seconds);
+      seek.dispatchEvent(new Event('input', { bubbles: true }));
+      seek.dispatchEvent(new Event('change', { bubbles: true }));
+      // Seeking while idle only remembers the position; start from there.
+      if (root.dataset.state !== 'playing' && root.dataset.state !== 'loading') {
+        root.querySelector('.play').click();
+      }
+    } else {
+      root.querySelector('.play').click();
+    }
+    const describe = () => 'state=' + root.dataset.state
+      + '; status=' + (text('#' + root.id + ' .player-status') || '')
+      + '; time=' + root.dataset.time;
+    try {
+      await until('loading', () => ['loading', 'playing', 'error'].includes(root.dataset.state)
+        || Number(root.dataset.completed) > before, 60000);
+    } catch (error) {
+      throw new Error(error.message + ' (' + describe() + ')');
+    }
+    if (root.dataset.state === 'error') {
+      throw new Error('player error: ' + (text('#' + root.id + ' .player-status') || ''));
+    }
+    await until('playing', () => root.dataset.state === 'playing'
+      || Number(root.dataset.completed) > before, 60000);
+    if (root.dataset.state === 'playing') {
+      await until('score time advances', () => Number(root.dataset.time) > (seconds || 0) + 0.05, 30000);
+    }
+  }
+  await playFrom(player);
+  await show('#nu/current/csound', 'csd text', tab('csound', '.source .code'));
+  result.player = {
+    state: player.dataset.state, time: Number(player.dataset.time),
+    caption: text('#player .player-caption'),
+    stillTheSameElement: doc().getElementById('player') === player,
+  };
+  player.querySelector('.stop').click();
+  await until('stopped', () => player.dataset.state === 'idle');
+  const target = 0.2;
+  await playFrom(player, target);
+  result.player.seekTarget = target;
+  result.player.seekedTo = Number(player.dataset.time);
+  player.querySelector('.stop').click();
+  await until('stopped after seek', () => player.dataset.state === 'idle');
+
+  // An archived version, reached with the Older button.
+  doc().getElementById('older').click();
+  await until('older version', () => doc().getElementById('version-select').value === 'version-0002');
+  doc().getElementById('older').click();
+  await until('oldest version', () => doc().getElementById('version-select').value === 'version-0001');
+  await until('old csd', () => (text('.source .code') || '').includes('FREQ=440'));
+  result.oldest = {
+    hash: frame.contentWindow.location.hash,
+    csd: text('.source .code'),
+    olderDisabled: doc().getElementById('older').disabled,
+    playerState: doc().getElementById('player').dataset.state,
+    caption: text('#player .player-caption'),
+  };
+  await show('#nu/version-0001/code', 'no code message', tab('code', '#panel .status'));
+  result.oldest.codeMessage = text('#panel .status');
+  await show('#nu/version-0001/prompts', 'prompts', tab('prompts', '.prompt pre'));
+  result.oldest.prompts = all('.prompt pre').map((pre) => pre.textContent);
+
+  // A composition published without its .csd: nothing to play.
+  await show('#xi', 'xi', () => text('#composition-title') === 'xi');
+  result.sparse = {
+    noPlayer: text('#player-none'), versions: all('#version-select option').length,
+    label: doc().querySelector('#version-select option').textContent,
+  };
+  await show('#xi/current/info', 'xi info', tab('info', 'dl.info'));
+  result.sparse.info = text('dl.info');
+  await show('#xi/current/compare', 'xi compare', tab('compare', '#panel .status'));
+  result.sparse.compare = text('#panel .status');
+
+  // Unknown composition, and back to the library.
+  await show('#nope', 'not found', () => text('#not-found'));
+  result.notFound = text('#not-found');
+  await show('#', 'library', () => all('.card').length > 0);
+  result.backToLibrary = all('.card').length;
+  return result;
+}
+
+// Whatever is really published: open every version of every composition.
+async function realSite(result) {
+  const catalog = await (await fetch('/compositions/catalog.json')).json();
+  result.compositions = [];
+  for (const composition of catalog.compositions) {
+    const entry = { name: composition.name, versions: [] };
+    for (const version of composition.versions) {
+      const label = `${composition.name}/${version.id}`;
+      const selected = () => doc().getElementById('version-select').value === version.id;
+      const item = { id: version.id };
+      if (version.csd) {
+        await show(`#${composition.name}/${version.id}/csound`, 'csd',
+          () => selected() && tab('csound', '.source .code')());
+        item.csd = text('.source .code');
+      }
+      await show(`#${composition.name}/${version.id}/prompts`, 'prompts',
+        () => selected() && doc().getElementById('panel').dataset.tab === 'prompts');
+      item.prompts = all('.prompt pre').map((pre) => pre.textContent);
+      item.overflow = overflow();
+      const player = doc().getElementById('player');
+      if (player && !doc().getElementById('player-none')) {
+        player.querySelector('.play').click();
+        await until('playing ' + label, () => player.dataset.state === 'playing', 60000);
+        await until('time ' + label, () => Number(player.dataset.time) > 0.05, 30000);
+        item.player = {
+          state: player.dataset.state, time: Number(player.dataset.time),
+          caption: text('#player .player-caption'),
+        };
+        player.querySelector('.stop').click();
+        await until('stopped ' + label, () => player.dataset.state === 'idle');
+      } else {
+        item.noPlayer = text('#player-none');
+      }
+      entry.versions.push(item);
+    }
+    result.compositions.push(entry);
+  }
+  return result;
+}
+
+run().catch((error) => ({ mode, error: String(error), stack: error.stack }))
+  .then((result) => fetch('/__result', { method: 'POST', body: JSON.stringify(result) }));
+</script>
+"""
+
+
+class Browser:
+    """Serves a directory with the studio's server and drives headless Chrome.
+
+    The harness page is served from memory and results are posted back, so
+    nothing is written into the directory being served.
+    """
+
+    def start_site(self, directory):
+        self.results = []
+        test = self
+
+        class Handler(serve.StaticHandler):
+            quiet = True
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(directory), **kwargs)
+
+            def do_GET(self):
+                if self.path.split("?")[0] == "/harness.html":
+                    body = HARNESS.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    super().do_GET()
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                test.results.append(json.loads(self.rfile.read(length)))
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.server = serve.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop_site(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def browse(self, mode, timeout=90):
+        profile = self.profiles / f"chrome-{mode}"
+        command = [
+            find_chrome(), "--headless=new", "--disable-gpu", "--no-first-run",
+            "--no-default-browser-check", "--disable-extensions", "--mute-audio",
+            "--autoplay-policy=no-user-gesture-required", f"--user-data-dir={profile}",
+            "--window-size=1200,1000",
+            # Without these, Chrome may throttle the harness's timers to one
+            # per second when it considers the page hidden.
+            "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+        ]
+        if sys.platform.startswith("linux"):
+            command += ["--no-sandbox", "--disable-dev-shm-usage"]
+        command.append(f"http://127.0.0.1:{self.port}/harness.html?mode={mode}")
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline and not self.results and process.poll() is None:
+                time.sleep(0.1)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self.assertTrue(self.results, "the browser did not report a result")
+        result = self.results.pop()
+        self.assertNotIn("error", result, result.get("stack"))
+        return result
+
+@unittest.skipUnless(find_chrome(), "Chrome or Chromium not found")
+class BrowserTests(Browser, StudioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.profiles = self.tmp
+        # The real player, including its @csound/browser engine.
+        shutil.copytree(REPO / "docs" / "studio", self.studio.player)
+        self.start_site(self.root / "docs")
+
+    def tearDown(self):
+        self.stop_site()
+        super().tearDown()
+
+    def test_missing_catalog_is_reported(self):
+        result = self.browse("missing")
+        self.assertEqual(result["state"], "error")
+        self.assertIn("could not be loaded", result["catalogError"])
+
+    def test_empty_library(self):
+        catalog.write(self.studio)
+        result = self.browse("empty")
+        self.assertEqual(result["state"], "ready")
+        self.assertIn("No compositions have been published yet", result["emptyLibrary"])
+        self.assertIn("Cursor", result["emptyLibrary"])
+        self.assertFalse(result["composeFormNew"])
+        self.assertIn("Create and revise pieces in Cursor", result["statusBar"])
+        self.assertEqual(result["cheatSheetHref"], "cheatsheet.html")
+        self.assertEqual(result["cheatSheetLabel"], "Cheat sheet")
+        self.assertIn('href="index.html"', result["commandSheet"])
+        self.assertIn(">Player<", result["commandSheet"])
+        self.assertIn("Create a composition named NAME", result["commandSheet"])
+        self.assertIn("Revise NAME", result["commandSheet"])
+        self.assertIn("studio new NAME", result["commandSheet"])
+        self.assertIn("studio stage NAME", result["commandSheet"])
+        self.assertTrue(result["csoundMessages"])
+        self.assertTrue(result["csoundMessagesShade"])
+        self.assertFalse(result["csoundMessagesDetails"])
+
+    def test_browsing_versions_sources_and_audio(self):
+        self.make_version(prompt="First prompt of nu.")
+        self.make_version(marker="FREQ=550", prompt="Second prompt of nu.",
+                          code={"nu-generate.py": "# generator two\nprint('two')\n"})
+        self.make_version(marker="FREQ=660", prompt="Third prompt of nu.",
+                          code={"nu-generate.py": "# generator three\nprint('three')\n"})
+        self.make_version(name="xi", prompt="Only prompt of xi.")
+        self.make_version(name="hidden", prompt="This one is never published.")
+        publish.publish(self.studio, ["nu"], kinds=publish.ALL_KINDS)
+        # No .csd published: the player has nothing to perform.
+        publish.publish(self.studio, ["xi"], kinds=("prompts", "manifest"))
+        result = self.browse("full", timeout=180)
+
+        # Catalog and selection.
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["library"], ["nu", "xi"])
+        self.assertNotIn("hidden", json.dumps(result))
+        self.assertFalse(result["composeFormNew"])
+        self.assertFalse(result["composeForm"])
+        self.assertFalse(result["composePrompt"])
+        self.assertTrue(result["csoundMessages"])
+        self.assertTrue(result["csoundMessagesShade"])
+        self.assertFalse(result["csoundMessagesDetails"])
+        self.assertTrue(result["csoundMessagesOutsidePlayer"])
+        self.assertEqual(result["title"], "nu")
+        self.assertEqual(result["versions"], ["current", "version-0002", "version-0001"])
+        self.assertEqual(result["selected"], "current")
+
+        # Prompts in order, the new one marked.
+        self.assertEqual([p.strip() for p in result["prompts"]],
+                         ["First prompt of nu.", "Second prompt of nu.", "Third prompt of nu."])
+        self.assertEqual(result["newPrompts"], ["Prompt 3"])
+
+        # Sources.
+        self.assertIn("FREQ=660", result["csd"])
+        self.assertIn("<CsoundSynthesizer>", result["csd"])
+        self.assertTrue(result["csdDownload"].endswith("/compositions/nu/nu.csd"))
+        self.assertIn("generator three", result["code"])
+        self.assertEqual(result["codeFiles"], ["nu-generate.py"])
+        self.assertIn("nu.csd", result["files"])
+        self.assertIn("nu-render.log", result["files"])
+        self.assertIn("nu-manifest.json", result["files"])
+        self.assertIn("test-model", result["info"])
+
+        # Comparison of the current version with the one before.
+        self.assertIn("+1", result["diffSummary"])
+        self.assertTrue(any("FREQ=660" in line for line in result["diffAdded"]))
+        self.assertTrue(any("FREQ=550" in line for line in result["diffRemoved"]))
+        self.assertEqual(result["compareOthers"], ["version-0002", "version-0001"])
+
+        # The .csd was performed in the browser; the player survived a tab change and seeked.
+        player = result["player"]
+        self.assertIn("WebAssembly", player["caption"])
+        self.assertIn("no soundfile", player["caption"].lower())
+        self.assertGreater(player["time"], 0.05)
+        self.assertTrue(player["stillTheSameElement"])
+        self.assertAlmostEqual(player["seekedTo"], player["seekTarget"], delta=0.15)
+
+        # Archived versions.
+        oldest = result["oldest"]
+        self.assertTrue(oldest["hash"].startswith("#nu/version-0001"))
+        self.assertIn("FREQ=440", oldest["csd"])
+        self.assertTrue(oldest["olderDisabled"])
+        self.assertIn("WebAssembly", oldest["caption"])
+        self.assertIn("written directly", oldest["codeMessage"])
+        self.assertEqual([p.strip() for p in oldest["prompts"]], ["First prompt of nu."])
+
+        # Missing optional artifacts are handled.
+        self.assertIn("cannot be played", result["sparse"]["noPlayer"])
+        self.assertEqual(result["sparse"]["versions"], 1)
+        self.assertTrue(result["sparse"]["label"].strip().startswith("Current"), result["sparse"]["label"])
+        self.assertIn("test-model", result["sparse"]["info"])
+        self.assertIn("nothing to compare", result["sparse"]["compare"])
+        self.assertIn("nope", result["notFound"])
+        self.assertEqual(result["backToLibrary"], 2)
+
+        # Phone-sized layout: nothing is wider than the 412 px frame.
+        for view, extra in result["overflow"].items():
+            self.assertLessEqual(extra, 0, f"the {view} view is {extra}px wider than a phone screen")
+
+
+@unittest.skipUnless(find_chrome(), "Chrome or Chromium not found")
+class PublishedSiteTests(Browser, unittest.TestCase):
+    """The files really published in this repository, in the real player.
+
+    docs/ is served as it is and only read.
+    """
+
+    def setUp(self):
+        self.catalog_path = REPO / "docs" / "compositions" / "catalog.json"
+        if not self.catalog_path.is_file():
+            self.skipTest("nothing has been published")
+        self.catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        if not self.catalog["compositions"]:
+            self.skipTest("nothing has been published")
+        self.profiles = Path(tempfile.mkdtemp(prefix="studio-chrome-"))
+        self.start_site(REPO / "docs")
+
+    def tearDown(self):
+        if hasattr(self, "server"):
+            self.stop_site()
+            shutil.rmtree(self.profiles, ignore_errors=True)
+
+    def test_every_published_version_opens_and_plays(self):
+        versions = sum(len(c["versions"]) for c in self.catalog["compositions"])
+        result = self.browse("real", timeout=60 + 20 * versions)
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual([c["name"] for c in result["compositions"]],
+                         [c["name"] for c in self.catalog["compositions"]])
+        for expected, shown in zip(self.catalog["compositions"], result["compositions"]):
+            self.assertEqual([v["id"] for v in shown["versions"]], [v["id"] for v in expected["versions"]])
+            for version, view in zip(expected["versions"], shown["versions"]):
+                label = f"{expected['name']} {version['id']}"
+                base = REPO / "docs" / "compositions"
+                if version.get("csd"):
+                    on_disk = (base / version["csd"]["path"]).read_text(encoding="utf-8")
+                    self.assertEqual(view["csd"].strip(), on_disk.strip(), label)
+                self.assertEqual(len(view["prompts"]), len(version["prompts"]), label)
+                for prompt, text in zip(version["prompts"], view["prompts"]):
+                    self.assertIn(text.strip(), expected["prompt_texts"][prompt["sha256"]], label)
+                self.assertLessEqual(view["overflow"], 0, label)
+                if version.get("csd"):
+                    self.assertEqual(view["player"]["state"], "playing", label)
+                    self.assertGreater(view["player"]["time"], 0.05, label)
+                    self.assertIn("WebAssembly", view["player"]["caption"], label)
+                else:
+                    self.assertIn("cannot be played", view.get("noPlayer") or "", label)
+
+
+@unittest.skipUnless(shutil.which(os.environ.get("STUDIO_NODE", "node")), "node not found")
+class DiffModuleTests(unittest.TestCase):
+    """diff.js, run under Node: applying the diff must reproduce both texts."""
+
+    SCRIPT = r"""
+import { diffLines, hunks, summarize } from %(module)s;
+let seed = 12345;
+const random = () => { seed = (seed * 1103515245 + 12345) %% 2147483648; return seed / 2147483648; };
+const lines = (count, alphabet) => Array.from({ length: count }, () => 'line ' + Math.floor(random() * alphabet));
+let checked = 0;
+const check = (oldText, newText) => {
+  const diff = diffLines(oldText, newText);
+  if (diff === null) throw new Error('unexpected null diff');
+  const join = (list) => (list.length ? list.join('\n') + '\n' : '');
+  const older = join(diff.filter((item) => item.type !== 'add').map((item) => item.line));
+  const newer = join(diff.filter((item) => item.type !== 'remove').map((item) => item.line));
+  const norm = (value) => (value === '' || value.endsWith('\n') ? value : value + '\n');
+  if (older !== norm(oldText) || newer !== norm(newText)) throw new Error('diff does not reproduce its inputs');
+  let a = 0; let b = 0;
+  for (const item of diff) {
+    if (item.type !== 'add' && item.a !== ++a) throw new Error('bad old line number');
+    if (item.type !== 'remove' && item.b !== ++b) throw new Error('bad new line number');
+  }
+  const total = hunks(diff).reduce((sum, hunk) => sum + (hunk.type === 'skip' ? hunk.count : hunk.items.length), 0);
+  if (total !== diff.length) throw new Error('hunks lose lines');
+  checked += 1;
+  return summarize(diff);
+};
+check('', ''); check('a\n', ''); check('', 'a\nb\n'); check('same\n', 'same\n');
+const one = check('a\nb\nc\n', 'a\nB\nc\n');
+if (one.added !== 1 || one.removed !== 1) throw new Error('wrong summary');
+for (let round = 0; round < 300; round += 1) {
+  const base = lines(Math.floor(random() * 60), 1 + Math.floor(random() * 12));
+  const other = base.slice();
+  for (let edit = 0; edit < Math.floor(random() * 12); edit += 1) {
+    const at = Math.floor(random() * (other.length + 1));
+    if (random() < 0.5) other.splice(at, 1); else other.splice(at, 0, 'new ' + Math.floor(random() * 5));
+  }
+  check(base.join('\n') + '\n', other.join('\n') + (random() < 0.5 ? '\n' : ''));
+}
+const big = Array.from({ length: 5000 }, (_, index) => 'x' + index);
+if (diffLines(big.join('\n'), big.map((line) => line + '!').join('\n')) !== null) throw new Error('expected null');
+console.log(JSON.stringify({ checked }));
+"""
+
+    def test_diff_reproduces_both_texts(self):
+        module = json.dumps((REPO / "docs" / "studio" / "diff.js").as_uri())
+        done = subprocess.run(
+            [shutil.which(os.environ.get("STUDIO_NODE", "node")), "--input-type=module", "-e",
+             self.SCRIPT % {"module": module}],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertGreater(json.loads(done.stdout)["checked"], 300)
+
+
+if __name__ == "__main__":
+    unittest.main()

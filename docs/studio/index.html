@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Player</title>
+<link rel="stylesheet" href="studio.css">
+<script src="prompt-link.js" defer></script>
+<script type="module" src="studio.js"></script>
+</head>
+<body>
+<header class="site-header">
+  <div class="site-header-row">
+    <span class="site-header-actions">
+      <a class="site-title" href="index.html" aria-current="page">Player</a>
+      <a id="cursor-prompt" href="cursor://anysphere.cursor-deeplink/prompt?text=Follow%20studio-tools%2FAGENT_INSTRUCTIONS.md.%20">Prompt</a>
+      <a id="cheat-sheet" href="cheatsheet.html">Cheat sheet</a>
+    </span>
+    <a class="site-home" href="../">Home</a>
+  </div>
+</header>
+<main id="app" aria-live="polite">
+  <p class="status">Loading the catalog…</p>
+</main>
+<footer class="site-footer" id="footer"></footer>
+<div id="csound-messages-host"></div>
+<p class="status-bar" id="site-readiness" role="status">Play a published piece here. Create and revise pieces in Cursor.</p>
+<noscript>
+  <p class="status">The Player needs JavaScript. The published files are in
+  <a href="../compositions/">../compositions/</a>.</p>
+</noscript>
+</body>
+</html>
