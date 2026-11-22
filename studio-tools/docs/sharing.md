@@ -2,8 +2,11 @@
 
 Someone else uses a starter repository, not a fork of this one. A fork
 would copy this catalog, the rest of the site, and the git history of
-both. The starter has the tools, the player, an empty library, and the
-Csound patches from `docs/silencio/patches/`.
+both. The published starter is
+[gogins/ai-composition-studio](https://github.com/gogins/ai-composition-studio).
+It has the tools, the player, an empty library, and the Csound patches
+from `docs/silencio/patches/`. **Use this template** on that repository
+starts a new repository with one commit and none of this history.
 
 ```sh
 studio export-template ~/ai-composition-studio
